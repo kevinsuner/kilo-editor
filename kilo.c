@@ -1,17 +1,25 @@
 /*** includes ***/
 
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 /*** defines ***/
 
 #define KILO_VERSION "0.0.1"
+#define KILO_TAB_STOP 8
 
 // bitwise-ANDs a character with the value 00011111, in binary. (In C, you generally specify
 // bitmasks using hexadecimal, since C doesn't have binary literals, and hexadecimal is more
@@ -34,10 +42,25 @@ enum editorKey {
 
 /*** data ***/
 
+typedef struct erow {
+	int size;
+	int rsize;
+	char *chars;
+	char *render;
+} erow;
+
 struct editorConfig {
 	int cx, cy;
+	int rx;
+	int rowoff;
+	int coloff;
 	int screenrows;
 	int screencols;
+	int numrows;
+	erow *row;
+	char *filename;
+	char statusmsg[80];
+	time_t statusmsg_time;
 	struct termios og_termios;
 };
 
@@ -207,6 +230,90 @@ int getWindowSize(int *rows, int *cols) {
 	}
 }
 
+/*** row operations ***/
+
+int editorRowCxToRx(erow *row, int cx) {
+	int rx = 0;
+	int j;
+	for (j = 0; j < cx; j++) {
+		if (row->chars[j] == '\t')
+			rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+		rx++;
+	}
+	return rx;
+}
+
+void editorUpdateRow(erow *row) {
+	int tabs = 0;
+	int j;
+	for (j = 0; j < row->size; j++)
+		if (row->chars[j] == '\t') tabs++;
+
+	free(row->render);
+	row->render = malloc(row->size + tabs*(KILO_TAB_STOP - 1) + 1);
+
+	int idx = 0;
+	for (j = 0; j < row->size; j++) {
+		if (row->chars[j] == '\t') {
+			row->render[idx++] = ' ';
+			while (idx % KILO_TAB_STOP != 0) row->render[idx++] = ' ';
+		} else {
+			row->render[idx++] = row->chars[j];
+		}
+	}
+	row->render[idx] = '\0';
+	row->rsize = idx;
+}
+
+void editorAppendRow(char *s, size_t len) {
+	E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+
+	int at = E.numrows;
+	E.row[at].size = len;
+	E.row[at].chars = malloc(len + 1);
+	memcpy(E.row[at].chars, s, len);
+	E.row[at].chars[len] = '\0';
+
+	E.row[at].rsize = 0;
+	E.row[at].render = NULL;
+	editorUpdateRow(&E.row[at]);
+
+	E.numrows++;
+}
+
+/*** file i/o ***/
+
+void editorOpen(char *filename) {
+	free(E.filename);
+	E.filename = strdup(filename);
+
+	FILE *fp = fopen(filename, "r");
+	if (!fp) die("fopen");
+
+	char *line = NULL;
+	size_t linecap = 0;
+	ssize_t linelen;
+
+	// getline() is useful for reading lines from a file when we don't know how much memory to allocate
+	// for each line. It takes care of memory management for you. First, we pass it a null line pointer
+	// and a linecap (line capacity) of 0. That makes it allocate new memory for the next line it reads,
+	// and set line to point to the memory, and set linecap to let you know how much memory is allocated.
+	// It's return value is the length of the line it read, or -1 if it's at the end of the file and there
+	// are no more lines to read
+	while ((linelen = getline(&line, &linecap, fp)) != -1) {
+		// We also strip off the newline or carriage return at the end of the line before copying it into
+		// our errow. We know each erow represents one line of text, so there's no use storing a newline
+		// character at the end of each one
+		while (linelen > 0 && (line[linelen - 1] == '\n' ||
+								line[linelen - 1] == '\r'))
+			linelen--;
+		editorAppendRow(line, linelen);
+	}
+
+	free(line);
+	fclose(fp);
+}
+
 /*** append buffer ***/
 
 struct abuf {
@@ -240,27 +347,55 @@ void abFree(struct abuf *ab) {
 
 /*** output ***/
 
+void editorScroll() {
+	E.rx = 0;
+	if (E.cy < E.numrows) {
+		E.rx = editorRowCxToRx(&E.row[E.cy], E.cx);
+	}
+
+	if (E.cy < E.rowoff) {
+		E.rowoff = E.cy;
+	}
+	if (E.cy >= E.rowoff + E.screenrows) {
+		E.rowoff = E.cy - E.screenrows + 1;
+	}
+	if (E.rx < E.coloff) {
+		E.coloff = E.rx;
+	}
+	if (E.rx >= E.coloff + E.screencols) {
+		E.coloff = E.rx - E.screencols + 1;
+	}
+}
+
 void editorDrawRows(struct abuf *ab) {
 	int y;
 	for (y = 0; y < E.screenrows; y++) {
-		if (y == E.screenrows / 3) {
-			char welcome[80];
-			int welcomelen = snprintf(welcome, sizeof(welcome), "Kilo editor -- version %s", KILO_VERSION);
-			if (welcomelen > E.screencols) welcomelen = E.screencols;
+		int filerow = y + E.rowoff;
+		if (filerow >= E.numrows) {
+			if (E.numrows == 0 && y == E.screenrows / 3) {
+				char welcome[80];
+				int welcomelen = snprintf(welcome, sizeof(welcome), "Kilo editor -- version %s", KILO_VERSION);
+				if (welcomelen > E.screencols) welcomelen = E.screencols;
 
-			// To center a string, you divide the screen width by 2, and then subtract half of the string's length
-			// from that. In other words: E.screencols/2 - welcomelen/2, which simplifies to (E.screencols - welcomelen) / 2
-			// That tells you how far from the left edge of the screen you should start printing the string.
-			// So we fill that space with space characters, except for the first character, which should be a tilde
-			int padding = (E.screencols - welcomelen) / 2;
-			if (padding) {
+				// To center a string, you divide the screen width by 2, and then subtract half of the string's length
+				// from that. In other words: E.screencols/2 - welcomelen/2, which simplifies to (E.screencols - welcomelen) / 2
+				// That tells you how far from the left edge of the screen you should start printing the string.
+				// So we fill that space with space characters, except for the first character, which should be a tilde
+				int padding = (E.screencols - welcomelen) / 2;
+				if (padding) {
+					abAppend(ab, "~", 1);
+					padding--;
+				}
+				while (padding--) abAppend(ab, " ", 1);
+				abAppend(ab, welcome, welcomelen);
+			} else {
 				abAppend(ab, "~", 1);
-				padding--;
 			}
-			while (padding--) abAppend(ab, " ", 1);
-			abAppend(ab, welcome, welcomelen);
 		} else {
-			abAppend(ab, "~", 1);
+			int len = E.row[filerow].rsize - E.coloff;
+			if (len < 0) len = 0;
+			if (len > E.screencols) len = E.screencols;
+			abAppend(ab, &E.row[filerow].render[E.coloff], len);
 		}
 
 		// The K command [Erase In Line](https://vt100.net/docs/vt100-ug/chapter3.html#EL)
@@ -268,13 +403,46 @@ void editorDrawRows(struct abuf *ab) {
 		// 1 erases the part of the line to the left of the cursor, and 0 erases the part of the line to the right of the
 		// cursor. 0 is the default argument, and that's what we want
 		abAppend(ab, "\x1b[K", 3);
-		if (y < E.screenrows - 1) {
-			abAppend(ab, "\r\n", 2);
+		abAppend(ab, "\r\n", 2);
+	}
+}
+
+void editorDrawStatusBar(struct abuf *ab) {
+	// The m command [Select Graphic Rendition](https://vt100.net/docs/vt100-ug/chapter3.html#SGR) causes the text printed
+	// after it to be printed with various possible attributes including bold (1), underscore (4), blink (5), and inverted
+	// colors (7). For example, you could specify all of these attributes using the command <esc>[1;4;5;7m. An argument of 0
+	// clears all attributes, and is the default argument, so we use <esc>[m to go back to normal text formatting
+	abAppend(ab, "\x1b[7m", 4);
+	char status[80], rstatus[80];
+	int len = snprintf(status, sizeof(status), "%.20s - %d lines", E.filename ? E.filename : "[No Name]", E.numrows);
+	int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d", E.cy + 1, E.numrows);
+	if (len > E.screencols) len = E.screencols;
+	abAppend(ab, status, len);
+	while (len < E.screencols) {
+		if (E.screencols - len == rlen) {
+			abAppend(ab, rstatus, rlen);
+			break;
+		} else {
+			abAppend(ab, " ", 1);
+			len++;
 		}
+	}
+	abAppend(ab, "\x1b[m", 3);
+	abAppend(ab, "\r\n", 2);
+}
+
+void editorDrawMessageBar(struct abuf *ab) {
+	abAppend(ab, "\x1b[K", 3);
+	int msglen = strlen(E.statusmsg);
+	if (msglen > E.screencols) msglen = E.screencols;
+	if (msglen && time(NULL) - E.statusmsg_time < 5) {
+		abAppend(ab, E.statusmsg, msglen);
 	}
 }
 
 void editorRefreshScreen() {
+	editorScroll();
+
 	struct abuf ab = ABUF_INIT;
 
 	// The first byte is \x1b which is the escape character, or 27 in decimal.
@@ -291,9 +459,12 @@ void editorRefreshScreen() {
 	abAppend(&ab, "\x1b[H", 3);
 
 	editorDrawRows(&ab);
+	editorDrawStatusBar(&ab);
+	editorDrawMessageBar(&ab);
 
 	char buf[32];
-	snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+	snprintf(buf, sizeof(buf), "\x1b[%d;%dH", (E.cy - E.rowoff) + 1, 
+												(E.rx - E.coloff) + 1);
 	abAppend(&ab, buf, strlen(buf));
 
 	// This escape sequence is 6 bytes long, and uses the h command [Set Mode](https://vt100.net/docs/vt100-ug/chapter3.html#SM)
@@ -304,18 +475,48 @@ void editorRefreshScreen() {
 	abFree(&ab);
 }
 
+// The ... argument makes editorSetStatusMessage() a [Variadic function](https://en.wikipedia.org/wiki/variadic_function)
+// meaning that it can take any number of arguments. C's way of dealing with these arguments is by having you call va_start()
+// and va_end() on a value of type va_list. The last argument before the ... (in this case, fmt) must be passed to va_start()
+// so that the address of the next argument is known. Then, between the va_start() and va_end() calls, you would call va_arg()
+// and pass it the type of the next argument (which you usually get from the given format string) and it would return the value
+// of that argument. In this case, we pass fmt and ap to vsnprintf() and it takes care of reading the format string and calling
+// va_arg() to get each argument
+void editorSetStatusMessage(const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+
+	// vsnprintf() helps us make our own printf()-style function
+	vsnprintf(E.statusmsg, sizeof(E.statusmsg), fmt, ap);
+	
+	va_end(ap);
+
+	// We set E.statusmsg_time to the current time which can be gotten by passing NULL to time().
+	// It returns the number of seconds that have passed since [midnight, January 1, 1970](https://en.wikipedia.org/wiki/Unix_time)
+	// as an integer
+	E.statusmsg_time = time(NULL);
+}
+
 /*** input ***/
 
 void editorMoveCursor(int key) {
+	erow *row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+
 	switch (key) {
 		case ARROW_LEFT:
 			if (E.cx != 0) {
 				E.cx--;
+			} else if (E.cy > 0) {
+				E.cy--;
+				E.cx = E.row[E.cy].size;
 			}
 			break;
 		case ARROW_RIGHT:
-			if (E.cx != E.screencols - 1) {
+			if (row && E.cx < row->size) {
 				E.cx++;
+			} else if (row && E.cx == row->size) {
+				E.cy++;
+				E.cx = 0;
 			}
 			break;
 		case ARROW_UP:
@@ -324,10 +525,16 @@ void editorMoveCursor(int key) {
 			}
 			break;
 		case ARROW_DOWN:
-			if (E.cy != E.screenrows - 1) {
+			if (E.cy < E.numrows) {
 				E.cy++;
 			}
 			break;
+	}
+
+	row = (E.cy >= E.numrows) ? NULL : &E.row[E.cy];
+	int rowlen = row ? row->size : 0;
+	if (E.cx > rowlen) {
+		E.cx = rowlen;
 	}
 }
 
@@ -346,12 +553,20 @@ void editorProcessKeypress() {
 			break;
 
 		case END_KEY:
-			E.cx = E.screencols - 1;
+			if (E.cy < E.numrows)
+				E.cx = E.row[E.cy].size;
 			break;
 		
 		case PAGE_UP:
 		case PAGE_DOWN:
 			{
+				if (c == PAGE_UP) {
+					E.cy = E.rowoff;
+				} else if (c == PAGE_DOWN) {
+					E.cy = E.rowoff + E.screenrows - 1;
+					if (E.cy > E.numrows) E.cy = E.numrows;
+				}
+
 				int times = E.screenrows;
 				while (times--)
 					editorMoveCursor(c == PAGE_UP ? ARROW_UP : ARROW_DOWN);
@@ -372,13 +587,27 @@ void editorProcessKeypress() {
 void initEditor() {
 	E.cx = 0;
 	E.cy = 0;
+	E.rx = 0;
+	E.rowoff = 0;
+	E.coloff = 0;
+	E.numrows = 0;
+	E.row = NULL;
+	E.filename = NULL;
+	E.statusmsg[0] = '\0';
+	E.statusmsg_time = 0;
 
 	if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
+	E.screenrows -= 2;
 }
 
-int main() {
+int main(int argc, char *argv[]) {
 	enableRawMode();
 	initEditor();
+	if (argc >= 2) {
+		editorOpen(argv[1]);
+	}
+
+	editorSetStatusMessage("HELP: Ctrl-Q = quit");
 
 	while (1) {
 		editorRefreshScreen();
